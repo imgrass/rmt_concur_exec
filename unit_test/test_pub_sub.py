@@ -6,7 +6,8 @@ import time
 
 sys.path.append(os.path.abspath('../'))
 from log_x import LogX
-from pub_sub import multi_process, msg_trans_proto
+from concur_handler import multi_process
+from pub_sub import publisher, subscriber
 
 
 Log = LogX(__name__)
@@ -16,63 +17,38 @@ Log.open_global_stdout()
 
 
 class unit_test(object):
-    '''
-    status:
-        1. wait:    sub process wait cmd to handle
-        2. okay:    sub process handle cmd successfully
-        3. fail:    handle failed
-        4. end:     pub_func check if the program(loop) should end
-    '''
-    date = time.time()
+    def __init__(self):
+        # ssh argvs
+        self.guest_queue = [
+                '172.17.0.2',
+                '172.17.0.3',
+                '172.17.0.4',
+                '172.17.0.5',
+                '172.17.0.6',
+                ]
+        self.user = 'root'
+        self.key_file = None
+        self.password = 'rootroot'
 
-    @staticmethod
-    def fin_func():
-        if time.time() - unit_test.date > 3:
-            return True
-        return False
+        self.cmd_lst = [
+                'date',
+                'hostname',
+                ]
+        self.concurrency = 1
+        self.mode = publisher.PUB_FLG_IGNORE_FAIL
 
-    @staticmethod
-    def pub_func(fdr, fdw, buf):
-        Log.info('pub_func: buf is %s' % buf)
-        if buf == 'wait':
-            Log.info('..<--pub recv wait')
-            msg_trans_proto.write(fdw, 'wait')
+        self.multi_process = multi_process(self.concurrency)
+        self.publisher = publisher(self.guest_queue, self.cmd_lst,
+                                   self.concurrency, self.mode)
+        self.subscriber = subscriber()
 
-        elif buf == 'okay':
-            Log.info('..<--pub recv okay')
-            msg_trans_proto.write(fdw, 'okay')
-
-        elif buf == 'fail':
-            Log.info('..<--pub recv fail')
-            msg_trans_proto.write(fdw, 'fail')
-
-        return False
-
-
-    @staticmethod
-    def sub_func(fdr, fdw):
-
-        Log.info('sub process<pid:%d, ppid:%d> inherit two pipe<fdr:%d, fdw:%d>' %
-              (os.getpid(), os.getppid(), fdr, fdw))
-
-        Log.info('sub process with <pid:%d> would send <msg:wait>'% os.getpid())
-        msg_trans_proto.write(fdw, 'wait')
-        rtn = msg_trans_proto.read(fdr, timeout=1)
-        Log.info('..-->sub recv %s' % rtn)
-
-        msg_trans_proto.write(fdw, 'okay')
-        rtn = msg_trans_proto.read(fdr, timeout=1)
-        Log.info('..-->sub recv %s' % rtn)
-
-        msg_trans_proto.write(fdw, 'fail')
-        rtn = msg_trans_proto.read(fdr, timeout=1)
-        Log.info('..-->sub recv %s' % rtn)
-
-        time.sleep(30)
+    def case(self):
+        self.multi_process.register_publisher(self.publisher)
+        self.multi_process.register_subscriber(self.subscriber,
+                                              self.user,
+                                              self.key_file,
+                                              self.password)
+        self.multi_process.start()
 
 
-test = multi_process(5)
-test.register_publisher(unit_test.pub_func)
-test.register_subscriber(unit_test.sub_func)
-test.register_finisher(unit_test.fin_func)
-test.start()
+unit_test().case()

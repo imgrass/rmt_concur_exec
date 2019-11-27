@@ -1,320 +1,361 @@
+'''\
+The protocol of publisher and subscriber is shown below:
+       +---+                       +---+
+       |pub|                       |sub|
+       +-+-+                       +-+-+
+         |                           |
+         |<---------wait-------------| waitting
+         |                           |
+         |-------ack\\r<host>------->| connecting
+         |                           |
+         |<------wait\\r<host>-------| connected
+         |----------cmd------------->|
+         |---------<cmd>------------>|
+         |<-----okay\\r<host>--------|
+         |---------okay------------->|
+         |         ......            |
+         |                           |
+         |<------wait\\r<host>-------|
+         |---------end-------------->| disconnecting
+         |                           |
+         |<---------wait-------------| waitting
+
+
+   case 1: ignore failed cmd
+         |         ......            |
+         |<------wait\\r<host>-------| connected
+         |----------cmd------------->|
+         |---------<cmd>------------>|
+         |<-----fail\\r<host>--------|
+         |                           |
+         |---------retry------------>|
+         |       ...3 times...       |
+         |<-----fail\\r<host>--------|
+         |---------ignore----------->|
+         |                           |
+         |<------wait\\r<host>-------|
+         |------next cmd------------>|
+         |         ......            |
+
+
+   case 1: end to execute when failed occurred
+         |         ......            |
+         |<------wait\\r<host>-------| connected
+         |----------cmd------------->|
+         |---------<cmd>------------>|
+         |<-----fail\\r<host>--------|
+         |                           |
+         |---------retry------------>|
+         |       ...3 times...       |
+         |<-----fail\\r<host>--------|
+         |-----------end------------>| disconnecting
+         |                           |
+         |<---------wait-------------| waitting
+\r'''
+
 from log_x import LogX
-import errno
-import fcntl
+from concur_handler import msg_trans_proto as mtp
+from ssh_handler import ssh_handler
+
 import os
-import resource
-import select
-import signal
-import string
-import sys
-import time
+
 
 Log = LogX(__name__)
 
-
-class pipe_link_exception(Exception):
-    def __init__(self, info):
-        self.info = info
-
-    def __str__(self):
-        return self.info
-
-
-class msg_trans_proto(object):
+class publisher(object):
     '''
-    Msg format:
-        +----------------------------+
-        |\0...|*|size|\0| ...load... |
-        +----------------------------+
-                ^
-                +--> the length of load, two bits(0x00 < len < 0xff(256))
-    assume bit of len is 2, msg is 'hello, world!', then show example as followed:
-
-        *head       '\0\0'
-        *separator  '*'
-        *size       '0d'
-        *load       'hello, world!'
-                +-----------------------+
-        msg --> |\0\0|*|0d|hello, world!|
-                +-----------------------+
+          inqueue--->+------------------------------+
+                     | +--+  +--+  +--+  +--+  +--+ |  dequeue
+        guest_queue: | |g1|  |g2|  |g3|  |..|  |gn| |-----------+
+                     | +--+  +--+  +--+  +--+  +--+ |           |
+                     +------------------------------+           |
+                                                                |
+                     +------------------------------+           |
+                     |  p1    p2    p3    ..    pn  |           |
+                     | +--+  +--+  +--+  +--+  +--+ |           |
+        recept_pool: | |id|  |id|  |id|  |id|  |id| |<----------+
+                     | +--+  +--+  +--+  +--+  +--+ | allocate reception
+                     | |G1|  |G2|  |G3|  |G.|  |Gn| | process for guest
+                     | +--+  +--+  +--+  +--+  +--+ |
+                     +------------------------------+
+                     ||  every process exec cmd in cmd_lst in order, and
+                     ||  modify map by response of executing cmd, every
+                     ||  process has four status:
+                     ||     @wait:  0x11
+                     ||     @hding: 0x10
+                     ||     @fail:  0x01
+                     ||     @okay:  0x00
+                     ||      +-------------------------------+
+                     ||      | +------+----+   +------+----+ |
+        cmd_lst:     |+----->| |0xffff|cmd1|   |0xffff|cmdn| |
+                     +------>| +------+----+   +------+----+ |
+                             +-------------------------------+
     '''
+    PUB_FLG_IGNORE_FAIL = 0x01
 
-    BITS_OF_LEN = 2
-    ## one bits represent one hex number 'f'
-    MAX_SIZE = 16 ** BITS_OF_LEN - 1
+    MAX_RETRIES = 1
 
-    @classmethod
-    def _read(cls, fdr, is_nonblock):
-        # set fdr non-blocking if is_nonblock is True
-        if is_nonblock:
-            fl = fcntl.fcntl(fdr, fcntl.F_GETFL)
-            fcntl.fcntl(fdr, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+    def __init__(self, guest_queue, cmd_lst, concurrency, mode=0x00):
+        # Note that: for simplicity, I use 'list' to format 'guest_queue', the
+        #       'dequeue' operator would be replaced by 'list.pop'. So the
+        #       first entry to be handled need to be placed at tail.
+        self.guest_queue = guest_queue
+        self.guest_queue.reverse()
+        Log.info('---> self.guest_queue is %s' % str(self.guest_queue))
 
-        # step 1: find head '\0...', number is BITS_OF_LEN
-        n_continue_zero = 0
-        while True:
-            latest_byte = os.read(fdr, 1)
-            if latest_byte == '\0':
-                n_continue_zero += 1
-            elif n_continue_zero < cls.BITS_OF_LEN:
-                n_continue_zero = 0
-            elif latest_byte == '*':
-                break
-            else:
-                raise Exception('the format of pipe msg is error!')
-
-        # step 2: parse len from flow
-        size = os.read(fdr, cls.BITS_OF_LEN)
-        size_oct = int(size, 0x10)
-
-        # step 3: parse packet load from flow
-        load = os.read(fdr, size_oct)
-        return load
-
-    @classmethod
-    def read(cls, fdr, timeout=0):
-        start_time = time.time()
-
-        is_nonblock = True
-        if timeout < 0:
-            is_nonblock = False
-
-        while True:
-            try:
-                return cls._read(fdr, is_nonblock)
-            except OSError as e:
-                if e.errno == errno.EAGAIN:
-                    # Log.warning('<fdr:%d> can not read any data' % fdr)
-                    pass
-                else:
-                    err_msg = '<fdr:%d> read pipe failed due to <%d:%s>' % \
-                              (e.errno, e.strerror)
-                    Log.error(err_msg)
-                    raise pipe_link_exception(err_msg)
-
-            eplased_time = time.time() - start_time
-            if eplased_time >= timeout:
-                return None
-
-    @classmethod
-    def write(cls, fdw, load):
-        if len(load) > cls.MAX_SIZE:
-            raise Exception('the size of load is larger than <limit:0x%.2X'
-                            % cls.MAX_SIZE)
-        head = ''.rjust(cls.BITS_OF_LEN, '\0')
-        separator = '*'
-        size_origin = '%X' % len(load)
-        size = size_origin.zfill(cls.BITS_OF_LEN)
-        msg = '%s%s%s%s' % (head, separator, size, load)
-        os.write(fdw, msg)
-
-
-class multi_process(object):
-    '''
-    This is publisher-subscriber system
-    +----------------------------------+  <--handle --<sub_func>
-    |  p1       p2       p3       pn   |
-    | +---+    +---+    +---+    +---+ |
-    | |sub|    |sub|    |sub|    |sub| |  one sub is one process
-    | +---+    +---+    +---+    +---+ |
-    +----------------------------------+
-       +-----+   |pipe ^
-       |epoll|   |msg  | msg_trans_proto
-       +-----+   v     |
-    +----------------------------------+  <--handle --<pub_func>
-    |               pub                |
-    +----------------------------------+  <--end loop --<fin_func>
-    '''
-
-    MAX_CONCURRENCY = 32
-    TIMEOUT = 0
-
-    def __init__(self, concurrency, timeout=None):
-
-        if concurrency > self.MAX_CONCURRENCY:
-            Log.error('number of concurrency is larger than the limit %d' %
-                      self.MAX_CONCURRENCY)
-            sys.exit(1)
+        # initialize cmd_lst
         self.concurrency = concurrency
-        self.process_pool = {}
+        p_map = 2 ** (2 * self.concurrency) - 1
+        self.cmd_lst = [[p_map, cmd] for cmd in cmd_lst]
 
-        if timeout:
-            self.TIMEOUT = timeout
-        self.epoll = select.epoll()
+        # initialize recept_pool
+        self.recept_pool = [[id, None] for id in xrange(self.concurrency)]
 
-        # Note:
-        #   *pub_func:      publisher --> publish msgs according the request
-        #                   of subscriber.
-        #   args ...
-        #       @read       fd for reading <--from-- (sub_func.write)
-        #       @write      fd for writing --to--> (sub_func.read)
-        #       @buf        the request or response buf coming from subscriber
-        #       @*argv      other args
-        #       @**kwargs   ...
-        #   *sub_func:      subscriber --> send request and then subscribe
-        #                   msgs and handle them
-        #   args ...
-        #       @read       fd for reading <--from-- (pub_func.write)
-        #       @write      fd for writing --to--> (pub_func.read)
-        #       @*argv      other args
-        #       @**kwargs   ...
+        # use to handle issue when remote exec cmd failed
+        self.mode = mode
+        self.n_retries = 0
 
-        self.pub_func = None
-        self.pub_func_argv = None
-        self.pub_func_kwargs = None
+    def _get_status(self, p_map, p_id):
+        status = p_map & (0x3 << (2 * p_id))
+        if status & 0x3:
+            return 'wait'
+        elif status & 0x02:
+            return 'hding'
+        elif status & 0x01:
+            return 'fail'
+        elif status & 0x00:
+            return 'okay'
 
-        self.sub_func = None
-        self.sub_func_argv = None
-        self.sub_func_kwargs = None
+    def _set_status_okay(self, index, p_id):
+        self.cmd_lst[index][0] &= (~(0x3 << (2 * p_id)))
 
-        self.fin_func = None
+    def _set_status_fail(self, index, p_id):
+        self.cmd_lst[index][0] &= (~(0x1 << (2 * p_id + 1)))
+        self.cmd_lst[index][0] |= (0x1 << (2 * p_id))
 
-    def _exit(self):
-        self._exit_process_in_pool()
-        Log.info('..(&.&).. end monitor process with <pid:%d>' % os.getpid())
-        # TODO: do clean up
-        sys.exit(0)
+    def _set_status_hding(self, index, p_id):
+        self.cmd_lst[index][0] &= (~(0x1 << (2 * p_id)))
+        self.cmd_lst[index][0] |= (0x1 << (2 * p_id + 1))
 
-    def register_publisher(self, pub_func, *argv, **kwargs):
-        self.pub_func = pub_func
-        self.pub_func_argv = argv
-        self.pub_func_kwargs = kwargs
+    def _set_status_wait(self, index, p_id):
+        self.cmd_lst[index][0] &= (0x3 << (2 * p_id))
 
-    def register_subscriber(self, sub_func, *argv, **kwargs):
-        self.sub_func = sub_func
-        self.sub_func_argv = argv
-        self.sub_func_kwargs = kwargs
+    def _find_next_waitted_cmd(self, p_id):
+        for p_map, cmd in self.cmd_lst:
+            status = self._get_status(p_map, p_id)
+            if status == 'wait':
+                return (False, cmd)
+            elif status == 'hding':
+                return (True, cmd)
+        return (False, None)
 
-    def register_finisher(self, fin_func):
-        self.fin_func = fin_func
+    def _get_p_id_by_host(self, host):
+        for p_id, guest in self.recept_pool:
+            if guest == host:
+                return p_id
+        return None
 
-    def _create_new_pipe_pair(self):
-        pr, cw = os.pipe()
-        cr, pw = os.pipe()
+    def _get_waitting_cmd_index(self, host):
+        p_id = self._get_p_id_by_host(host)
+        for i in xrange(len(self.cmd_lst)):
+            if self._get_status(self.cmd_lst[i][0], p_id) == 'wait':
+                return i
+        return None
 
-        try:
-            pid = os.fork()
-        except OSError as e:
-            raise Exception('fork failed due to %s:%s' %
-                            (e.errno, e.strerror))
+    def handler(self, fdr, fdw):
+        self.fdr = fdr
+        self.fdw = fdw
 
-        if pid == 0:
-            # for child process
-            os.close(pr)
-            os.close(pw)
-            self.sub_func(cr, cw, *self.sub_func_argv, **self.sub_func_kwargs)
+        req = mtp.read(fdr)
+        if req == 'wait':
+            # allocate host to this process
+            self.hd_waitting()
+            return
 
-            Log.error('sub process should not run here')
-            sys.exit(1)
-        else:
-            # for parent process
-            Log.info('(^_^) create sub process successfully! With <pid:%d>'
-                     'and two pipe pw(%d)->cr(%d) and cw(%d)->pr(%d)' %
-                     (pid, pw, cr, cw, pr))
-            os.close(cr)
-            os.close(cw)
-            self.process_pool[pr] = {'pid':pid, 'pw':pw}
-            self.epoll.register(pr, select.EPOLLIN)
+        head = req.split('\r')[0]
+        host = req.split('\r')[1]
+        Log.info('  ..&_& publisher recieve <reqest:%s:%s>' % (head, host))
 
-    def _restore_pipe(self, fdr):
-        Log.info('--> try to restore pipe by create new sub process')
-        self.epoll.unregister(fdr)
+        if head == 'wait':
+            self.hd_connected_wait(host)
+        elif head == 'okay':
+            self.hd_connected_okay(host)
+        elif head == 'fail':
+            self.hd_connected_fail(host)
 
-        pid = self.process_pool[fdr]['pid']
-        os.kill(pid, signal.SIGKILL)
-        self.process_pool.pop(fdr)
+    # check if main loop need to be break
+    def fin_func(self):
+        if len(self.guest_queue) > 0:
+            return False
 
-        self._create_new_pipe_pair()
+        for p_id, guest in self.recept_pool:
+            if guest:
+                return False
 
-    def start(self):
-        self._init_process_in_pool()
-        # TODO: when pipe disconnected, it need to restore it by restarting
-        #       new process
+        return True
 
-        # to monitor which pair of pipe(fdr/fdw) is using when pipe breaking
-        self.runtime_pr = None
-        while True:
-            try:
-                self._manage_process_pool()
-            except OSError as e:
-                if e.errno == errno.EPIPE:
-                    Log.warning('Pipe<pr:%d> disconnected with sub process'
-                                '<pid:%d> due to %s' %
-                                (self.runtime_pr,
-                                 self.process_pool[self.runtime_pr]['pid'],
-                                 e.strerror))
-                    self._restore_pipe(self.runtime_pr)
-                else:
-                    Log.error('Unexception failed!<%d:%s>' %
-                              (e.errno, e.strerror))
-                    self._exit()
-            except Exception as e:
-                    Log.error('Unexception failed!<%d:%s>' %
-                              (e.errno, e.strerror))
-                    self._exit()
+    def hd_waitting(self):
+        if len(self.cmd_lst) == 0:
+            return
 
-    def _manage_process_pool(self):
-        while True:
-            # the time of breaking main loop is determined by publisher
-            if self.fin_func():
-                self._exit()
+        # find free process in recept_pool
+        for p_id, host in self.recept_pool:
+            if not host:
                 break
-
-            events = self.epoll.poll(self.TIMEOUT)
-            if not events:
-                Log.debug('**poll time out, re-polling')
-                continue;
-
-            Log.debug('**there are %d new events, start to handle ...' %
-                      len(events))
-            for pr, event in events:
-                self.runtime_pr = pr
-                if event & select.EPOLLIN:
-                    pw = self.process_pool[pr]['pw']
-                    buf = msg_trans_proto.read(pr)
-                    Log.debug('--> read <buf:%s> from <fdr:%d>' % (buf, pr))
-                    self.pub_func(pr, pw, buf, *self.pub_func_argv,
-                                  **self.pub_func_kwargs)
-
-    def _exit_process_in_pool(self):
-        for pr in self.process_pool.keys():
-            pid = self.process_pool[pr]['pid']
-            pw = self.process_pool[pr]['pw']
-            Log.info('...end process <pid:%d>' % pid)
-            os.kill(pid, signal.SIGKILL)
-            os.close(pr)
-            os.close(pw)
-
-    def _init_process_in_pool(self):
-        Log.info('init process poll with concurrency:%d' % self.concurrency)
-        for i in xrange(self.concurrency):
-            self._create_new_pipe_pair()
-
-    def daemonize(self):
-        Log.info('Daemonize process...')
-        try:
-            pid = os.fork()
-        except OSError as e:
-            raise Exception('fork failed due to %s:%s' % (e.errno, e.strerror))
-
-        if pid == 0:
-            os.setsid()
-            signal.signal(signal.SIGHUP, signal.SIG_IGN)
-
-            try:
-                pid = os.fork()
-            except OSError as e:
-                raise Exception('fork failed due to %s:%s' %
-                                (e.errno, e.strerror))
-
-            if pid == 0:
-                os.chdir('/')
-                os.umask(0)
-            else:
-                os._exit(0)
+        if len(self.guest_queue) > 0:
+            new_guest = self.guest_queue.pop()
         else:
-            os._exit(0)
+            Log.info('(^_^)> No guest need to be servered')
+            return
 
-        # it was originally necessary to turn off all fds to avoid side-effect
-        # but I wish this process can inherite fd open by 'Log'
-        return 0
+        self.recept_pool[p_id][1] = new_guest
+        for i in xrange(len(self.cmd_lst)):
+            self._set_status_wait(i, p_id)
+
+        mtp.write(self.fdw, 'ack\r%s' % new_guest)
+
+    def hd_connected_wait(self, host):
+        # find which process recept this guest
+        p_id = self._get_p_id_by_host(host)
+
+        is_hding, next_waitted_cmd = self._find_next_waitted_cmd(p_id)
+        if is_hding:
+            return
+
+        if next_waitted_cmd:
+            mtp.write(self.fdw, 'cmd')
+            mtp.write(self.fdw, next_waitted_cmd)
+            index = self._get_waitting_cmd_index(host)
+            self._set_status_hding(index, p_id)
+        else:
+            Log.info('  ..(^_^)<host:%s> exec all cmds completely!' % host)
+            mtp.write(self.fdw, 'end')
+            self.recept_pool[p_id][1] = None
+
+    def hd_connected_okay(self, host):
+        p_id = self._get_p_id_by_host(host)
+        index = self._get_waitting_cmd_index(host)
+        Log.info('-=-> <%s> <p_map:%d> <p_id:%d>' %
+                 (str(self.cmd_lst), index, p_id))
+        self._set_status_okay(index, p_id)
+        Log.info('-=-> <%s> <p_map:%d> <p_id:%d>' %
+                 (str(self.cmd_lst), index, p_id))
+        self._set_status_okay(index, p_id)
+        mtp.write(self.fdw, 'okay')
+        return
+
+    def hd_connected_fail(self, host):
+        p_id = self._get_p_id_by_host(host)
+        if self.mode & publisher.PUB_FLG_IGNORE_FAIL:
+            mtp.write(self.fdw, 'ignore')
+            index = self._get_waitting_cmd_index(host)
+            self._set_status_fail(index, p_id)
+
+        if self.n_retries < self.MAX_RETRIES:
+            mtp.write(self.fdw, 'retry')
+            self.n_retries += 1
+            return
+        else:
+            mtp.write(self.fdw, 'end')
+            self.recept_pool[p_id][1] = None
+
+
+class subscriber(object):
+    def __init__(self):
+        # used for ssh loading
+        self.host = None
+        self.port = None
+        self.user = None
+        self.key_file = None
+        self.password = None
+        self.ssh_handler = ssh_handler()
+
+        self.fdr = None
+        self.fdw = None
+        self.latest_cmd = None
+
+    def _rmt_exec_cmd(self):
+        Log.info('    @<pid:%d><host:%s> exec <%s>' %
+                  (os.getpid(), self.host, self.latest_cmd))
+        stdout, stderr = self.ssh_handler.exec_cmd(self.latest_cmd)
+
+        err_info = stderr.read()
+        if len(err_info):
+            Log.warning('  ..@_@.<host:%s> exec <%s> return fail' %
+                        (self.host, self.latest_cmd))
+            Log.warning('  --> stderr:\n%s' % err_info)
+            return False
+
+        Log.info('  --> stdout:\n%s' % stdout.read())
+        return True
+
+
+    def handler(self, fdr, fdw, user, key_file, password, port=22):
+        self.fdr = fdr
+        self.fdw = fdw
+        self.user = user
+        self.key_file = key_file
+        self.password = password
+        self.port = port
+
+        while True:
+            self.hd_waitting()
+            self.hd_connecting()
+            self.hd_connected()
+            self.hd_disconnecting()
+
+    def hd_waitting(self):
+        Log.info('sub process <pid:%d> waitting for task...' % os.getpid())
+        mtp.write(self.fdw, 'wait')
+
+    def hd_connecting(self):
+        while True:
+            rsp = mtp.read(self.fdr, timeout=-1)
+            head = rsp.split('\r')[0]
+            load = rsp.split('\r')[1]
+
+            if head == 'ack' and len(load) > 0:
+                self.host = load
+                Log.info('sub process <pid:%d> is connecting <host:%s>...' %
+                         (os.getpid(), self.host))
+                return
+
+            self.hd_waitting()
+
+    def hd_connected(self):
+        kwargs = {
+                'addr':         self.host,
+                'port':         self.port,
+                'username':     self.user,
+                'key_filename': self.key_file,
+                'password':     self.password,
+                }
+        # if connecting failed, exiting this sub process
+        self.ssh_handler.create_ssh_channel(**kwargs)
+        Log.info('<pid:%d> connected <host:%s> successfully!' %
+                 (os.getpid(), self.host))
+
+        mtp.write(self.fdw, 'wait\r%s' % self.host)
+        while True:
+            reply = mtp.read(self.fdr, timeout=-1)
+            Log.info('  ..*_* subscriber recieved <reply:%s>' % reply)
+            if reply == 'okay' or reply == 'retry':
+                mtp.write(self.fdw, 'wait\r%s' % self.host)
+                continue
+            elif reply == 'end':
+                return
+            elif reply == 'cmd':
+                self.latest_cmd = mtp.read(self.fdr, timeout=-1)
+                Log.info('  ..*_* subscriber exec <cmd:%s>' % self.latest_cmd)
+            elif reply == 'ignore':
+                pass
+
+            if self._rmt_exec_cmd():
+                Log.info('  ..*_* subscriber send okay')
+                mtp.write(self.fdw, 'okay\r%s' % self.host)
+            else:
+                Log.info('  ..*_* subscriber send fail')
+                mtp.write(self.fdw, 'fail\r%s' % self.host)
+
+    def hd_disconnecting(self):
+        self.ssh_handler.disconnect_ssh_channel()

@@ -17,9 +17,10 @@ Log.open_global_stdout()
 class unit_test(object):
     def case1(self):
         kwargs = {
-                'addr': '',
+                'addr': '172.17.0.5',
                 'port': 22,
-                'username': '',
+                'username': 'root',
+                'password': 'rootroot',
                 'key_filename': '',}
         self.handler = ssh_handler()
         self.handler.create_ssh_channel(**kwargs)
@@ -32,10 +33,10 @@ class unit_test(object):
     def case2(self):
         self.handler.disconnect_ssh_channel()
         kwargs = {
-                'addr': '',
+                'addr': '172.17.0.6',
                 'port': 22,
-                'username': '',
-                'key_filename': '',}
+                'username': 'root',
+                'password': 'rootroot',}
         self.handler.create_ssh_channel(**kwargs)
 
         stdout, stderr = self.handler.exec_cmd('hostname')
