@@ -32,10 +32,13 @@ class unit_test(object):
 
         self.cmd_lst = [
                 'date',
+                'date1',
                 'hostname',
+                'cat /etc/hosts',
                 ]
         self.concurrency = 1
-        self.mode = publisher.PUB_FLG_IGNORE_FAIL
+        self.mode = 0x00
+        self.mode |= publisher.PUB_FLG_IGNORE_FAIL
 
         self.multi_process = multi_process(self.concurrency)
         self.publisher = publisher(self.guest_queue, self.cmd_lst,

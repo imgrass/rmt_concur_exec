@@ -101,7 +101,6 @@ class publisher(object):
         #       first entry to be handled need to be placed at tail.
         self.guest_queue = guest_queue
         self.guest_queue.reverse()
-        Log.info('---> self.guest_queue is %s' % str(self.guest_queue))
 
         # initialize cmd_lst
         self.concurrency = concurrency
@@ -117,13 +116,13 @@ class publisher(object):
 
     def _get_status(self, p_map, p_id):
         status = p_map & (0x3 << (2 * p_id))
-        if status & 0x3:
+        if status is 0x3:
             return 'wait'
-        elif status & 0x02:
+        elif status is 0x02:
             return 'hding'
-        elif status & 0x01:
+        elif status is 0x01:
             return 'fail'
-        elif status & 0x00:
+        elif status is 0x00:
             return 'okay'
 
     def _set_status_okay(self, index, p_id):
@@ -138,7 +137,7 @@ class publisher(object):
         self.cmd_lst[index][0] |= (0x1 << (2 * p_id + 1))
 
     def _set_status_wait(self, index, p_id):
-        self.cmd_lst[index][0] &= (0x3 << (2 * p_id))
+        self.cmd_lst[index][0] |= (0x3 << (2 * p_id))
 
     def _find_next_waitted_cmd(self, p_id):
         for p_map, cmd in self.cmd_lst:
@@ -158,7 +157,8 @@ class publisher(object):
     def _get_waitting_cmd_index(self, host):
         p_id = self._get_p_id_by_host(host)
         for i in xrange(len(self.cmd_lst)):
-            if self._get_status(self.cmd_lst[i][0], p_id) == 'wait':
+            status = self._get_status(self.cmd_lst[i][0], p_id)
+            if status == 'wait'or status == 'hding':
                 return i
         return None
 
@@ -174,7 +174,6 @@ class publisher(object):
 
         head = req.split('\r')[0]
         host = req.split('\r')[1]
-        Log.info('  ..&_& publisher recieve <reqest:%s:%s>' % (head, host))
 
         if head == 'wait':
             self.hd_connected_wait(host)
@@ -213,6 +212,7 @@ class publisher(object):
             self._set_status_wait(i, p_id)
 
         mtp.write(self.fdw, 'ack\r%s' % new_guest)
+        self.n_retries = 0
 
     def hd_connected_wait(self, host):
         # find which process recept this guest
@@ -235,12 +235,9 @@ class publisher(object):
     def hd_connected_okay(self, host):
         p_id = self._get_p_id_by_host(host)
         index = self._get_waitting_cmd_index(host)
-        Log.info('-=-> <%s> <p_map:%d> <p_id:%d>' %
-                 (str(self.cmd_lst), index, p_id))
+        Log.debug('--> self.cmd_lst okay is %s' % str(self.cmd_lst))
         self._set_status_okay(index, p_id)
-        Log.info('-=-> <%s> <p_map:%d> <p_id:%d>' %
-                 (str(self.cmd_lst), index, p_id))
-        self._set_status_okay(index, p_id)
+        Log.debug('--> self.cmd_lst okay is %s' % str(self.cmd_lst))
         mtp.write(self.fdw, 'okay')
         return
 
@@ -249,7 +246,10 @@ class publisher(object):
         if self.mode & publisher.PUB_FLG_IGNORE_FAIL:
             mtp.write(self.fdw, 'ignore')
             index = self._get_waitting_cmd_index(host)
+            Log.debug('--> self.cmd_lst fail is %s' % str(self.cmd_lst))
             self._set_status_fail(index, p_id)
+            Log.debug('--> self.cmd_lst fail is %s' % str(self.cmd_lst))
+            return
 
         if self.n_retries < self.MAX_RETRIES:
             mtp.write(self.fdw, 'retry')
@@ -283,10 +283,10 @@ class subscriber(object):
         if len(err_info):
             Log.warning('  ..@_@.<host:%s> exec <%s> return fail' %
                         (self.host, self.latest_cmd))
-            Log.warning('  --> stderr:\n%s' % err_info)
+            Log.warning('  --> stderr:%s' % err_info)
             return False
 
-        Log.info('  --> stdout:\n%s' % stdout.read())
+        Log.info('  --> stdout:%s' % stdout.read())
         return True
 
 
@@ -305,7 +305,7 @@ class subscriber(object):
             self.hd_disconnecting()
 
     def hd_waitting(self):
-        Log.info('sub process <pid:%d> waitting for task...' % os.getpid())
+        Log.debug('sub process <pid:%d> waitting for task...' % os.getpid())
         mtp.write(self.fdw, 'wait')
 
     def hd_connecting(self):
@@ -316,7 +316,7 @@ class subscriber(object):
 
             if head == 'ack' and len(load) > 0:
                 self.host = load
-                Log.info('sub process <pid:%d> is connecting <host:%s>...' %
+                Log.debug('sub process <pid:%d> is connecting <host:%s>...' %
                          (os.getpid(), self.host))
                 return
 
@@ -338,23 +338,20 @@ class subscriber(object):
         mtp.write(self.fdw, 'wait\r%s' % self.host)
         while True:
             reply = mtp.read(self.fdr, timeout=-1)
-            Log.info('  ..*_* subscriber recieved <reply:%s>' % reply)
-            if reply == 'okay' or reply == 'retry':
+            if reply == 'okay' or reply == 'ignore':
                 mtp.write(self.fdw, 'wait\r%s' % self.host)
                 continue
             elif reply == 'end':
                 return
             elif reply == 'cmd':
                 self.latest_cmd = mtp.read(self.fdr, timeout=-1)
-                Log.info('  ..*_* subscriber exec <cmd:%s>' % self.latest_cmd)
-            elif reply == 'ignore':
+                Log.debug('  ..*_* subscriber exec <cmd:%s>' % self.latest_cmd)
+            elif reply == 'retry':
                 pass
 
             if self._rmt_exec_cmd():
-                Log.info('  ..*_* subscriber send okay')
                 mtp.write(self.fdw, 'okay\r%s' % self.host)
             else:
-                Log.info('  ..*_* subscriber send fail')
                 mtp.write(self.fdw, 'fail\r%s' % self.host)
 
     def hd_disconnecting(self):

@@ -83,11 +83,10 @@ class msg_trans_proto(object):
             try:
                 #return cls._read(fdr, is_nonblock)
                 buf = cls._read(fdr, is_nonblock)
-                Log.info('..-read-<pid:%s> read <%s>' % (os.getpid(), buf))
+                Log.debug('..-read-<pid:%s> read <%s>' % (os.getpid(), buf))
                 return buf
             except OSError as e:
                 if e.errno == errno.EAGAIN:
-                    # Log.warning('<fdr:%d> can not read any data' % fdr)
                     pass
                 else:
                     err_msg = '<fdr:%d> read pipe failed due to <%d:%s>' % \
@@ -110,7 +109,7 @@ class msg_trans_proto(object):
         size = size_origin.zfill(cls.BITS_OF_LEN)
         msg = '%s%s%s%s' % (head, separator, size, load)
         os.write(fdw, msg)
-        Log.info('..-write-<pid:%s> write <%s>' % (os.getpid(), msg))
+        Log.debug('..-write-<pid:%s> write <%s>' % (os.getpid(), msg))
 
 
 class multi_process(object):
@@ -215,7 +214,7 @@ class multi_process(object):
             sys.exit(1)
         else:
             # for parent process
-            Log.info('(^_^) create sub process successfully! With <pid:%d>'
+            Log.info('  (^_^) create sub process successfully! With <pid:%d>'
                      'and two pipe pw(%d)->cr(%d) and cw(%d)->pr(%d)' %
                      (pid, pw, cr, cw, pr))
             os.close(cr)
@@ -255,9 +254,6 @@ class multi_process(object):
                     Log.error('Unexception failed!<%d:%s>' %
                               (e.errno, e.strerror))
                     self._exit()
-            #except Exception as e:
-            #        Log.error('Unexception failed due to %s' % e)
-            #        self._exit()
 
     def _manage_process_pool(self):
         while True:
@@ -268,15 +264,12 @@ class multi_process(object):
 
             events = self.epoll.poll(self.TIMEOUT)
             if not events:
-                Log.debug('**poll time out, re-polling')
                 continue;
 
             for pr, event in events:
                 self.runtime_pr = pr
                 if event & select.EPOLLIN:
                     pw = self.process_pool[pr]['pw']
-                    #buf = msg_trans_proto.read(pr)
-                    #Log.debug('--> read <buf:%s> from <fdr:%d>' % (buf, pr))
                     self.pub_func(pr, pw, *self.pub_func_argv,
                                   **self.pub_func_kwargs)
 
