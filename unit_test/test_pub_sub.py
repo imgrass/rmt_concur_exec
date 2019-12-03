@@ -36,7 +36,7 @@ class unit_test(object):
                 'hostname',
                 'cat /etc/hosts',
                 ]
-        self.concurrency = 1
+        self.concurrency = 5
         self.mode = 0x00
         self.mode |= publisher.PUB_FLG_IGNORE_FAIL
 
