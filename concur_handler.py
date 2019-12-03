@@ -39,7 +39,7 @@ class msg_trans_proto(object):
                 +-----------------------+
     '''
 
-    BITS_OF_LEN = 2
+    BITS_OF_LEN = 3
     ## one bits represent one hex number 'f'
     MAX_SIZE = 16 ** BITS_OF_LEN - 1
 
@@ -194,6 +194,10 @@ class multi_process(object):
         self.sub_func_argv = argv
         self.sub_func_kwargs = kwargs
 
+    def _sig_handler(self, sig, frame):
+        Log.info('--> Caught kill signal <%s>, exit process' % sig)
+        self._exit()
+
     def _create_new_pipe_pair(self):
         pr, cw = os.pipe()
         cr, pw = os.pipe()
@@ -221,6 +225,10 @@ class multi_process(object):
             os.close(cw)
             self.process_pool[pr] = {'pid':pid, 'pw':pw}
             self.epoll.register(pr, select.EPOLLIN)
+
+            # register signal handler
+            signal.signal(signal.SIGTERM, self._sig_handler)
+            signal.signal(signal.SIGINT, self._sig_handler)
 
     def _restore_pipe(self, fdr):
         Log.info('--> try to restore pipe by create new sub process')

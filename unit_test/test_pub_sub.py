@@ -8,11 +8,12 @@ sys.path.append(os.path.abspath('../'))
 from log_x import LogX
 from concur_handler import multi_process
 from pub_sub import publisher, subscriber
+from db_handler import db_handler
 
 
 Log = LogX(__name__)
 log_file = './log/%s.log' % __file__.split('.')[0]
-Log.set_public_atrr(LogX.INFO, log_file)
+Log.set_public_atrr(LogX.DEBUG, log_file)
 Log.open_global_stdout()
 
 
@@ -53,5 +54,17 @@ class unit_test(object):
                                               self.password)
         self.multi_process.start()
 
+    def case_with_db(self):
+        db_name = 'log/%s.db' % __file__.split('.')[0]
+        hdr = db_handler(db_name, is_replace=True)
 
-unit_test().case()
+        self.publisher.set_db_handler(hdr)
+        self.multi_process.register_publisher(self.publisher)
+        self.multi_process.register_subscriber(self.subscriber,
+                                              self.user,
+                                              self.key_file,
+                                              self.password)
+        self.multi_process.start()
+
+
+unit_test().case_with_db()

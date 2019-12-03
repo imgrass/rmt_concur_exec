@@ -11,7 +11,7 @@ The protocol of publisher and subscriber is shown below:
          |<------wait\\r<host>-------| connected
          |----------cmd------------->|
          |---------<cmd>------------>|
-         |<-----okay\\r<host>--------|
+         |<-okay\\r<host>\\r<result>-|
          |---------okay------------->|
          |         ......            |
          |                           |
@@ -26,11 +26,11 @@ The protocol of publisher and subscriber is shown below:
          |<------wait\\r<host>-------| connected
          |----------cmd------------->|
          |---------<cmd>------------>|
-         |<-----fail\\r<host>--------|
+         |<-fail\\r<host>\\r<result>-|
          |                           |
          |---------retry------------>|
          |       ...3 times...       |
-         |<-----fail\\r<host>--------|
+         |<-fail\\r<host>\\r<result>-|
          |---------ignore----------->|
          |                           |
          |<------wait\\r<host>-------|
@@ -43,7 +43,7 @@ The protocol of publisher and subscriber is shown below:
          |<------wait\\r<host>-------| connected
          |----------cmd------------->|
          |---------<cmd>------------>|
-         |<-----fail\\r<host>--------|
+         |<-fail\\r<host>\\r<result>-|
          |                           |
          |---------retry------------>|
          |       ...3 times...       |
@@ -81,16 +81,21 @@ class publisher(object):
                      ||  every process exec cmd in cmd_lst in order, and
                      ||  modify map by response of executing cmd, every
                      ||  process has four status:
-                     ||     @wait:  0x11
-                     ||     @hding: 0x10
-                     ||     @fail:  0x01
-                     ||     @okay:  0x00
+                     ||     @wait:  2#11
+                     ||     @hding: 2#10
+                     ||     @fail:  2#01
+                     ||     @okay:  2#00
                      ||      +-------------------------------+
                      ||      | +------+----+   +------+----+ |
         cmd_lst:     |+----->| |0xffff|cmd1|   |0xffff|cmdn| |
                      +------>| +------+----+   +------+----+ |
                              +-------------------------------+
     '''
+    STATUS_WAIT  = 0x03
+    STATUS_HDING = 0x02
+    STATUS_FAIL  = 0x01
+    STATUS_OKAY  = 0x00
+
     PUB_FLG_IGNORE_FAIL = 0x01
 
     MAX_RETRIES = 1
@@ -114,15 +119,35 @@ class publisher(object):
         self.mode = mode
         self.n_retries = 0
 
+        # database
+        self.db_handler = None
+
+    def __del__(self):
+        if self.db_handler:
+            self.db_handler.commit()
+
+    def set_db_handler(self, db_handler):
+        self.db_handler = db_handler
+
+        # init table <tb_hosts> and <tb_commands>
+        # note that <guest_queue> is reversed
+        len_guest_queue = len(self.guest_queue)
+        for i in xrange(len_guest_queue):
+            self.db_handler.put_host(self.guest_queue[len_guest_queue-i-1], 0)
+
+        for p_map, cmd in self.cmd_lst:
+            self.db_handler.put_command(cmd)
+
     def _get_status(self, p_map, p_id):
-        status = p_map & (0x3 << (2 * p_id))
-        if status is 0x3:
+        status = (p_map & (0x3 << (2 * p_id))) >> (2 * p_id)
+        Log.debug('....> status is %d' % status)
+        if status is self.STATUS_WAIT:
             return 'wait'
-        elif status is 0x02:
+        elif status is self.STATUS_HDING:
             return 'hding'
-        elif status is 0x01:
+        elif status is self.STATUS_FAIL:
             return 'fail'
-        elif status is 0x00:
+        elif status is self.STATUS_OKAY:
             return 'okay'
 
     def _set_status_okay(self, index, p_id):
@@ -140,8 +165,10 @@ class publisher(object):
         self.cmd_lst[index][0] |= (0x3 << (2 * p_id))
 
     def _find_next_waitted_cmd(self, p_id):
+        Log.debug('..>p_id:%d & cmd_lst is <%s>' % (p_id, str(self.cmd_lst)))
         for p_map, cmd in self.cmd_lst:
             status = self._get_status(p_map, p_id)
+            Log.debug('...><p_map:%d> <status:%s> <cmd:%s>' % (p_map, status, cmd))
             if status == 'wait':
                 return (False, cmd)
             elif status == 'hding':
@@ -162,6 +189,17 @@ class publisher(object):
                 return i
         return None
 
+    ## add record to database if connected
+    # record: <host, cmd, status, result>
+    def _record_result(self, host, cmd, status, result):
+        if not self.db_handler:
+            Log.debug('--<host:%s> <flg:%s> <result:%s>' %
+                      (host, flg_status, result))
+            return
+        Log.info('  record result <host:%s> <cmd:%s> <status:%d> <result:%s>' %
+                 (host, cmd, status, result))
+        self.db_handler.put_result(host, cmd, status, result)
+
     def handler(self, fdr, fdw):
         self.fdr = fdr
         self.fdw = fdw
@@ -178,9 +216,11 @@ class publisher(object):
         if head == 'wait':
             self.hd_connected_wait(host)
         elif head == 'okay':
-            self.hd_connected_okay(host)
+            result = req.split('\r')[2]
+            self.hd_connected_okay(host, result)
         elif head == 'fail':
-            self.hd_connected_fail(host)
+            result = req.split('\r')[2]
+            self.hd_connected_fail(host, result)
 
     # check if main loop need to be break
     def fin_func(self):
@@ -232,23 +272,25 @@ class publisher(object):
             mtp.write(self.fdw, 'end')
             self.recept_pool[p_id][1] = None
 
-    def hd_connected_okay(self, host):
+    def hd_connected_okay(self, host, result):
         p_id = self._get_p_id_by_host(host)
         index = self._get_waitting_cmd_index(host)
-        Log.debug('--> self.cmd_lst okay is %s' % str(self.cmd_lst))
         self._set_status_okay(index, p_id)
-        Log.debug('--> self.cmd_lst okay is %s' % str(self.cmd_lst))
+
+        self._record_result(host, self.cmd_lst[index][1], self.STATUS_OKAY,
+                            result)
+
         mtp.write(self.fdw, 'okay')
         return
 
-    def hd_connected_fail(self, host):
+    def hd_connected_fail(self, host, result):
         p_id = self._get_p_id_by_host(host)
         if self.mode & publisher.PUB_FLG_IGNORE_FAIL:
             mtp.write(self.fdw, 'ignore')
             index = self._get_waitting_cmd_index(host)
-            Log.debug('--> self.cmd_lst fail is %s' % str(self.cmd_lst))
             self._set_status_fail(index, p_id)
-            Log.debug('--> self.cmd_lst fail is %s' % str(self.cmd_lst))
+            self._record_result(host, self.cmd_lst[index][1], self.STATUS_FAIL,
+                                result)
             return
 
         if self.n_retries < self.MAX_RETRIES:
@@ -256,6 +298,9 @@ class publisher(object):
             self.n_retries += 1
             return
         else:
+            index = self._get_waitting_cmd_index(host)
+            self._record_result(host, self.cmd_lst[index][1], self.STATUS_FAIL,
+                                result)
             mtp.write(self.fdw, 'end')
             self.recept_pool[p_id][1] = None
 
@@ -279,15 +324,16 @@ class subscriber(object):
                   (os.getpid(), self.host, self.latest_cmd))
         stdout, stderr = self.ssh_handler.exec_cmd(self.latest_cmd)
 
-        err_info = stderr.read()
-        if len(err_info):
+        str_buf = stderr.read()
+        if len(str_buf):
             Log.warning('  ..@_@.<host:%s> exec <%s> return fail' %
                         (self.host, self.latest_cmd))
-            Log.warning('  --> stderr:%s' % err_info)
-            return False
+            Log.warning('  --> stderr:%s' % str_buf)
+            return False, str_buf
 
-        Log.info('  --> stdout:%s' % stdout.read())
-        return True
+        str_buf = stdout.read()
+        Log.info('  --> stdout:%s' % str_buf)
+        return True, str_buf
 
 
     def handler(self, fdr, fdw, user, key_file, password, port=22):
@@ -349,10 +395,11 @@ class subscriber(object):
             elif reply == 'retry':
                 pass
 
-            if self._rmt_exec_cmd():
-                mtp.write(self.fdw, 'okay\r%s' % self.host)
+            status, str_buf = self._rmt_exec_cmd()
+            if status:
+                mtp.write(self.fdw, 'okay\r%s\r%s' % (self.host, str_buf))
             else:
-                mtp.write(self.fdw, 'fail\r%s' % self.host)
+                mtp.write(self.fdw, 'fail\r%s\r%s' % (self.host, str_buf))
 
     def hd_disconnecting(self):
         self.ssh_handler.disconnect_ssh_channel()

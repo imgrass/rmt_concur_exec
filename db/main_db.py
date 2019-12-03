@@ -7,6 +7,10 @@ from db_handler import table_base
 
 
 class tb_results(table_base):
+    '''
+    status: STATUS_OKAY: 0x00
+            STATUS_FAIL: 0x01
+    '''
     __tablename__ = 'results'
 
     def create_table(self):
