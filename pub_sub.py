@@ -62,6 +62,7 @@ import os
 
 Log = LogX(__name__)
 
+
 class publisher(object):
     '''
           inqueue--->+------------------------------+
@@ -100,12 +101,27 @@ class publisher(object):
 
     MAX_RETRIES = 1
 
-    def __init__(self, guest_queue, cmd_lst, concurrency, mode=0x00):
+    def __init__(self, guest_queue, cmd_lst, concurrency, group=None,
+                 mode=0x00):
         # Note that: for simplicity, I use 'list' to format 'guest_queue', the
         #       'dequeue' operator would be replaced by 'list.pop'. So the
         #       first entry to be handled need to be placed at tail.
+        #
+        #       @concurrency    the number of processes processed in parallel,
+        #                       note that it is less or equal than the number
+        #                       of actual processes. it is recommended that
+        #                       they be equal.
+        #
+        #       @group          the number of guests received per group. it is
+        #                       greater or equal than the concurrency
         self.guest_queue = guest_queue
         self.guest_queue.reverse()
+        self.group = group
+        if self.group:
+            if concurrency > self.group:
+                raise Exception('the number of concurrency:%d > group:%d' %
+                                (concurrency, self.group))
+            self.n_received_guests = 0
 
         # initialize cmd_lst
         self.concurrency = concurrency
@@ -123,8 +139,13 @@ class publisher(object):
         self.db_handler = None
 
     def __del__(self):
-        if self.db_handler:
-            self.db_handler.commit()
+        ## when cls <publisher> exit when __init__, the method <db_handler> is
+        #  not existed in self.
+        try:
+            db_handler = getattr(self, 'db_handler')
+            db_handler.commit()
+        except AttributeError:
+            pass
 
     def set_db_handler(self, db_handler):
         self.db_handler = db_handler
@@ -194,11 +215,41 @@ class publisher(object):
     def _record_result(self, host, cmd, status, result):
         if not self.db_handler:
             Log.debug('--<host:%s> <flg:%s> <result:%s>' %
-                      (host, flg_status, result))
+                      (host, status, result))
             return
         Log.info('  record result <host:%s> <cmd:%s> <status:%d> <result:%s>' %
                  (host, cmd, status, result))
         self.db_handler.put_result(host, cmd, status, result)
+
+    def _prompt_group(self):
+        lst_host_group = []
+        for i in xrange(1, self.group+1):
+            try:
+                lst_host_group.append(self.guest_queue[-i])
+            except IndexError:
+                break
+        str_host_group = ', '.join(lst_host_group)
+
+        lst_cmds = [cmd for p_map, cmd in self.cmd_lst]
+        str_cmds = ', '.join(lst_cmds)
+
+        print(\
+            '''\
+                \r%s
+                \r  hosts: %s
+                \r%s
+                \r  cmds: %s
+                \r%s\
+            ''' %
+            (64*'*', str_host_group, 64*'-', str_cmds, 64*'*')
+            )
+        confirm = raw_input('do you confirm to execute those cmds on the '
+                            'hosts?(y/Y/all):')
+        if confirm in ['y', 'Y']:
+            print('...okay, execute now')
+            return
+        else:
+            raise Exception('pub:exit')
 
     def handler(self, fdr, fdw):
         self.fdr = fdr
@@ -241,8 +292,17 @@ class publisher(object):
         for p_id, host in self.recept_pool:
             if not host:
                 break
+
+        # used for group.
+        if self.group and self.n_received_guests >= self.group:
+            self.n_received_guests = 0
+        if self.group and self.n_received_guests is 0:
+            self._prompt_group()
+
         if len(self.guest_queue) > 0:
             new_guest = self.guest_queue.pop()
+            if self.group:
+                self.n_received_guests += 1
         else:
             Log.info('(^_^)> No guest need to be servered')
             return

@@ -262,6 +262,14 @@ class multi_process(object):
                     Log.error('Unexception failed!<%d:%s>' %
                               (e.errno, e.strerror))
                     self._exit()
+            except Exception as e:
+                msg = '%s' % e
+                if msg == 'pub:exit':
+                    Log.info('...(^_^)> publisher exit..')
+                else:
+                    Log.error('...(>_<!)> exit due to %s' % e)
+                    # print_error_track to debug
+                self._exit()
 
     def _manage_process_pool(self):
         while True:

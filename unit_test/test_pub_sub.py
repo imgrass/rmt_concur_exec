@@ -13,7 +13,7 @@ from db_handler import db_handler
 
 Log = LogX(__name__)
 log_file = './log/%s.log' % __file__.split('.')[0]
-Log.set_public_atrr(LogX.DEBUG, log_file)
+Log.set_public_atrr(LogX.INFO, log_file)
 Log.open_global_stdout()
 
 
@@ -43,7 +43,7 @@ class unit_test(object):
 
         self.multi_process = multi_process(self.concurrency)
         self.publisher = publisher(self.guest_queue, self.cmd_lst,
-                                   self.concurrency, self.mode)
+                                   self.concurrency, mode=self.mode)
         self.subscriber = subscriber()
 
     def case(self):
